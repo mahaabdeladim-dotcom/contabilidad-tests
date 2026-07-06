@@ -1,6 +1,6 @@
 // Service worker: precacha la app y sirve desde caché (offline-first),
 // actualizando en segundo plano cuando hay conexión.
-const VERSION = '325861c201'; // sync_pwa.js lo sustituye por un hash del contenido
+const VERSION = '96407d5a70'; // sync_pwa.js lo sustituye por un hash del contenido
 const CACHE = 'contab-' + VERSION;
 const ASSETS = ['./', './index.html', './manifest.webmanifest', './icon-180.png', './icon-512.png'];
 

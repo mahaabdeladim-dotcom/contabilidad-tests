@@ -284,7 +284,8 @@ const DEF = {
   tests:[],           // historial (más reciente primero)
   tt:{},              // "tema-idx" -> {n, best, last}
   slowIdx:0,          // cursor del registro de "Lentas": por dónde va la paginación de 10 en 10
-  pr:{}               // práctica de asientos: casoId -> {score, total}
+  pr:{},              // práctica de asientos: casoId -> {score, total}
+  resetAt:0           // cuándo se borró todo por última vez (lo usa la sincronización)
 };
 function freshDef(){ return JSON.parse(JSON.stringify(DEF)); }
 let S = freshDef();
@@ -298,7 +299,150 @@ if (storeOk) {
     }
   } catch(e){}
 }
-function save(){ if(!storeOk) return; try{ localStorage.setItem(KEY, JSON.stringify(S)); }catch(e){} }
+function save(){ if(!storeOk) return; try{ localStorage.setItem(KEY, JSON.stringify(S)); }catch(e){} SY.touch(); }
+
+/* ================== SINCRONIZACIÓN ENTRE DISPOSITIVOS ==================
+   Guarda el progreso en un repositorio PRIVADO de GitHub (progress.json).
+   Cada dispositivo funciona 100% offline y, cuando hay conexión, sube sus
+   cambios y baja los del resto fusionándolos (no se pisa el progreso). */
+function b64e(str){ return btoa(unescape(encodeURIComponent(str))); }
+function b64d(str){ return decodeURIComponent(escape(atob(String(str).replace(/\s/g,"")))); }
+// Serialización canónica (claves ordenadas) para comparar estados sin falsos "distinto"
+function stableStr(x){
+  if(x===undefined) return "null";
+  if(x===null || typeof x!=="object") return JSON.stringify(x);
+  if(Array.isArray(x)) return "["+x.map(stableStr).join(",")+"]";
+  return "{"+Object.keys(x).filter(k=>x[k]!==undefined).sort().map(k=>JSON.stringify(k)+":"+stableStr(x[k])).join(",")+"}";
+}
+function progData(){ return {tests:S.tests,seen:S.seen,pool:S.pool,tt:S.tt,cfg:S.cfg,pr:S.pr,slowIdx:S.slowIdx,resetAt:S.resetAt||0}; }
+
+// Fusión de dos progresos. aAt/bAt = cuándo se modificó cada uno por última vez.
+// Contadores → máximo de ambos; historial → unión; lo que es "estado actual"
+// (fallos pendientes, config, cursor de Lentas) → gana el lado más reciente.
+// Si uno hizo "Borrar todo" más tarde que el otro, ese lado gana entero.
+function mergeProg(a, aAt, b, bAt){
+  const cp = x => JSON.parse(JSON.stringify(x));
+  if((a.resetAt||0)!==(b.resetAt||0)) return cp((a.resetAt||0)>(b.resetAt||0)? a : b);
+  const newer = aAt>=bAt? a : b;
+  const out = {resetAt:a.resetAt||0};
+  out.seen={};
+  const sa=a.seen||{}, sb=b.seen||{};
+  for(const id of new Set([...Object.keys(sa),...Object.keys(sb)])){
+    const x=sa[id], y=sb[id];
+    if(!x||!y){ out.seen[id]=cp(x||y); continue; }
+    out.seen[id]={a:Math.max(x.a||0,y.a||0), f:Math.max(x.f||0,y.f||0), ok:((newer.seen||{})[id]||x).ok, ts:Math.max(x.ts||0,y.ts||0)};
+  }
+  out.pool = cp(newer.pool||[]);
+  const seenTs=new Set(); out.tests=[];
+  for(const t of [...(a.tests||[]),...(b.tests||[])]){ if(!t||seenTs.has(t.ts)) continue; seenTs.add(t.ts); out.tests.push(cp(t)); }
+  out.tests.sort((x,y)=>(y.ts||0)-(x.ts||0));
+  if(out.tests.length>60) out.tests.length=60;
+  out.tt={};
+  const ta=a.tt||{}, tb=b.tt||{};
+  for(const k of new Set([...Object.keys(ta),...Object.keys(tb)])){
+    const x=ta[k], y=tb[k];
+    if(!x||!y){ out.tt[k]=cp(x||y); continue; }
+    out.tt[k]={n:Math.max(x.n||0,y.n||0), best:Math.max(x.best||0,y.best||0), last:((newer.tt||{})[k]||x).last};
+  }
+  out.pr={};
+  const pa=a.pr||{}, pb=b.pr||{};
+  for(const k of new Set([...Object.keys(pa),...Object.keys(pb)])){
+    const x=pa[k], y=pb[k];
+    out.pr[k]=cp(!x? y : !y? x : ((y.score||0)>(x.score||0)? y : x));
+  }
+  out.cfg = cp(newer.cfg || a.cfg || b.cfg || {});
+  out.slowIdx = newer.slowIdx||0;
+  return out;
+}
+
+const SY = {
+  cfg:null, syncing:false, applying:false, timer:null,
+  load(){ try{ const r=localStorage.getItem("contabSync.v1"); if(r){ const c=JSON.parse(r); if(c && c.t && c.r) this.cfg=c; } }catch(e){} },
+  persist(){ if(this.cfg){ try{ localStorage.setItem("contabSync.v1", JSON.stringify(this.cfg)); }catch(e){} } },
+  touch(){
+    if(!this.cfg || this.applying) return;
+    this.cfg.dirty=true; this.cfg.mAt=Date.now(); this.persist();
+    clearTimeout(this.timer); this.timer=setTimeout(()=>this.syncNow(), 8000);
+  },
+  connect(code){
+    let p=null; try{ p=JSON.parse(b64d(code)); }catch(e){}
+    if(!p || p.s!=="contab-sync" || !p.t || !p.r){ toast("El código de sincronización no es válido"); return false; }
+    this.cfg={t:p.t, r:p.r, dev:"d"+Math.random().toString(36).slice(2,8), rev:0, dirty:true, mAt:Date.now(), last:0};
+    this.persist(); this.syncNow(); return true;
+  },
+  disconnect(){ this.cfg=null; clearTimeout(this.timer); try{ localStorage.removeItem("contabSync.v1"); }catch(e){} },
+  url(){ return "https://api.github.com/repos/"+this.cfg.r+"/contents/progress.json"; },
+  hdr(){ return {Authorization:"Bearer "+this.cfg.t, Accept:"application/vnd.github+json"}; },
+  inQuiz(){ return view.name==="quiz" || view.name==="pquiz" || view.name==="results"; },
+  setStatus(msg){ const el=document.getElementById("systat"); if(el) el.textContent = msg || this.statusText(); },
+  statusText(){
+    if(!this.cfg) return "Desactivada";
+    if(this.syncing) return "Sincronizando…";
+    if(!navigator.onLine) return "Sin conexión · se sincronizará sola al volver"+(this.cfg.dirty? " (cambios pendientes)":"");
+    if(this.cfg.dirty) return "Cambios pendientes de subir";
+    return this.cfg.last? "Al día · última: "+fmtDate(this.cfg.last) : "Conectada";
+  },
+  async syncNow(){
+    const c=this.cfg;
+    if(!c || this.syncing) return;
+    if(!navigator.onLine){ this.setStatus(); return; }
+    this.syncing=true; this.setStatus();
+    let err=null;
+    try{
+      for(let i=0;i<3;i++){
+        err=null;
+        const g=await fetch(this.url()+"?ref=main&nc="+Date.now(), {headers:this.hdr(), cache:"no-store"});
+        let remote=null, sha=null;
+        if(g.status===200){
+          const j=await g.json(); sha=j.sha;
+          try{ remote=JSON.parse(b64d(j.content||"")); }catch(e){ remote=null; }
+        } else if(g.status!==404){ throw new Error("HTTP "+g.status); }
+        if(remote && remote.rev>(c.rev||0)){
+          if(this.inQuiz()){ err="postpone"; break; }   // no tocar el estado en mitad de un test
+          const merged=mergeProg(progData(), c.dirty? (c.mAt||0) : 0, remote.data||{}, remote.at||0);
+          this.apply(merged);
+          c.rev=remote.rev;
+          c.dirty = stableStr(merged)!==stableStr(remote.data);  // si la fusión aporta algo, hay que subirla
+        }
+        if(c.dirty || !remote){
+          c.dirty=false;  // si algo cambia mientras subimos, touch() lo vuelve a marcar
+          const body={v:1, rev:(remote? remote.rev : (c.rev||0))+1, at:Date.now(), dev:c.dev, data:progData()};
+          const put=await fetch(this.url(), {method:"PUT", headers:Object.assign(this.hdr(),{"Content-Type":"application/json"}),
+            body: JSON.stringify({message:"sync "+c.dev+" rev "+body.rev, branch:"main", content:b64e(JSON.stringify(body)), sha: sha||undefined})});
+          if(put.status===409 || put.status===422){ c.dirty=true; await new Promise(r=>setTimeout(r,1500)); continue; }  // otro dispositivo subió a la vez → esperar y reintentar
+          if(!put.ok){ c.dirty=true; throw new Error("HTTP "+put.status); }
+          c.rev=body.rev;
+        }
+        c.last=Date.now(); break;
+      }
+    }catch(e){ err=e; }
+    this.persist();
+    this.syncing=false;
+    if(err==="postpone") this.setStatus("Hay progreso nuevo de otro dispositivo · se aplicará al salir del test");
+    else if(err) this.setStatus("No se pudo sincronizar · se reintentará solo");
+    else this.setStatus();
+  },
+  apply(d){
+    this.applying=true;
+    try{
+      S.tests=d.tests||[]; S.seen=d.seen||{}; S.pool=d.pool||[]; S.tt=d.tt||{}; S.pr=d.pr||{}; S.slowIdx=d.slowIdx||0; S.resetAt=d.resetAt||0;
+      S.cfg=Object.assign(freshDef().cfg, d.cfg||{});
+      save();
+    } finally { this.applying=false; }
+    if(!this.inQuiz()) render();
+  },
+  boot(){
+    this.load();
+    addEventListener("online", ()=>this.syncNow());
+    document.addEventListener("visibilitychange", ()=>{
+      if(!this.cfg) return;
+      if(document.visibilityState==="visible") this.syncNow();
+      else if(this.cfg.dirty) this.syncNow();
+    });
+    setInterval(()=>{ if(this.cfg && (this.cfg.dirty || Date.now()-(this.cfg.last||0)>300000)) this.syncNow(); }, 60000);
+    if(this.cfg) setTimeout(()=>this.syncNow(), 600);
+  }
+};
 
 /* ================== UTILIDADES ================== */
 const $ = sel => document.querySelector(sel);
@@ -891,9 +1035,17 @@ const A = {
     openSheet(`<div class="grab"></div><h3>Ajustes</h3>
       <div class="frow"><div><div class="fl">Apariencia</div><div class="fd">La app usa modo oscuro por defecto</div></div>
         <div class="seg"><button class="${S.theme==="dark"?"on":""}" onclick="A.setTheme('dark')">Oscuro</button><button class="${S.theme==="light"?"on":""}" onclick="A.setTheme('light')">Claro</button></div></div>
-      <div class="frow"><div><div class="fl">Progreso guardado</div><div class="fd">${S.tests.length} tests · ${Object.keys(S.seen).length} preguntas vistas · sólo en este dispositivo</div></div></div>
+      <div class="frow"><div><div class="fl">Progreso guardado</div><div class="fd">${S.tests.length} tests · ${Object.keys(S.seen).length} preguntas vistas${SY.cfg? "" : " · sólo en este dispositivo"}</div></div></div>
+      <div class="frow" style="flex-direction:column;align-items:stretch;gap:8px">
+        <div><div class="fl">Sincronización entre dispositivos</div><div class="fd" id="systat">${SY.statusText()}</div></div>
+        ${SY.cfg
+          ? `<div style="display:flex;gap:8px">
+              <button class="btn soft" style="margin:0" onclick="A.syncNowBtn()">Sincronizar ahora</button>
+              <button class="btn gray" style="margin:0" onclick="A.syncOff()">Desconectar</button></div>`
+          : `<button class="btn soft" style="margin:0" onclick="A.syncSheet()">Conectar sincronización</button>`}
+      </div>
       <div class="frow" style="flex-direction:column;align-items:stretch;gap:8px;border-bottom:none">
-        <div><div class="fl">Pasar el progreso a otro dispositivo</div><div class="fd">Copia el código aquí y pégalo en la app del otro dispositivo. No hay sincronización automática.</div></div>
+        <div><div class="fl">Pasar el progreso a otro dispositivo</div><div class="fd">Copia manual puntual (p. ej. con la versión de claude.ai). Con la sincronización activada no suele hacer falta.</div></div>
         <div style="display:flex;gap:8px">
           <button class="btn soft" style="margin:0" onclick="A.exportProg()">Copiar código</button>
           <button class="btn gray" style="margin:0" onclick="A.importSheet()">Pegar código</button>
@@ -901,9 +1053,24 @@ const A = {
       </div>
       <button class="btn red" style="margin-top:10px" onclick="A.resetAsk()">Borrar todo el progreso</button>
       <button class="btn gray" onclick="A.closeSheet()">Cerrar</button>`);
+    if(SY.cfg) SY.syncNow();
   },
+  syncSheet(){
+    openSheet(`<div class="grab"></div><h3>Conectar sincronización</h3>
+      <p style="color:var(--text2);font-size:14px;margin:0 0 10px">Pega el código de sincronización (el mismo en todos tus dispositivos). El progreso se fusionará y se mantendrá igual en todos automáticamente cuando haya conexión; sin conexión la app funciona normal y sincroniza al volver.</p>
+      <textarea id="synccode" style="width:100%;height:110px;background:var(--card2);color:var(--text);border:none;border-radius:12px;padding:12px;font-size:11px;font-family:monospace;word-break:break-all" placeholder="Pega el código aquí…"></textarea>
+      <button class="btn" style="margin-top:12px" onclick="A.syncConnect()">Conectar</button>
+      <button class="btn gray" onclick="A.settings()">Cancelar</button>`);
+  },
+  syncConnect(){
+    const code=(document.getElementById("synccode").value||"").trim();
+    if(!code){ toast("Pega primero el código"); return; }
+    if(SY.connect(code)){ toast("Sincronización conectada ✓"); A.settings(); }
+  },
+  syncNowBtn(){ SY.syncNow(); },
+  syncOff(){ SY.disconnect(); toast("Sincronización desconectada"); A.settings(); },
   exportProg(){
-    const code = btoa(unescape(encodeURIComponent(JSON.stringify({v:1,tests:S.tests,seen:S.seen,pool:S.pool,tt:S.tt,cfg:S.cfg,pr:S.pr,slowIdx:S.slowIdx}))));
+    const code = btoa(unescape(encodeURIComponent(JSON.stringify({v:1,tests:S.tests,seen:S.seen,pool:S.pool,tt:S.tt,cfg:S.cfg,pr:S.pr,slowIdx:S.slowIdx,resetAt:S.resetAt||0}))));
     openSheet(`<div class="grab"></div><h3>Tu código de progreso</h3>
       <p style="color:var(--text2);font-size:14px;margin:0 0 10px">Cópialo y pégalo en «Ajustes → Pegar código» del otro dispositivo. Sustituirá el progreso de aquel dispositivo.</p>
       <textarea id="expcode" readonly style="width:100%;height:110px;background:var(--card2);color:var(--text);border:none;border-radius:12px;padding:12px;font-size:11px;font-family:monospace;word-break:break-all" onclick="this.select()">${code}</textarea>
@@ -930,7 +1097,7 @@ const A = {
     try {
       const p = JSON.parse(decodeURIComponent(escape(atob(code))));
       if(!p || p.v!==1 || !Array.isArray(p.tests)) throw new Error("formato");
-      S.tests = p.tests; S.seen = p.seen||{}; S.pool = p.pool||[]; S.tt = p.tt||{}; S.pr = p.pr||{}; S.slowIdx = p.slowIdx||0;
+      S.tests = p.tests; S.seen = p.seen||{}; S.pool = p.pool||[]; S.tt = p.tt||{}; S.pr = p.pr||{}; S.slowIdx = p.slowIdx||0; S.resetAt = p.resetAt||0;
       if(p.cfg) S.cfg = Object.assign(freshDef().cfg, p.cfg);
       save(); closeSheet(); render();
       toast("Progreso importado ✓");
@@ -943,7 +1110,7 @@ const A = {
       <button class="btn red" onclick="A.resetAll()">Borrar todo</button>
       <button class="btn gray" onclick="A.settings()">Cancelar</button>`);
   },
-  resetAll(){ const th=S.theme; S = freshDef(); S.theme=th; save(); closeSheet(); toast("Progreso borrado"); render(); },
+  resetAll(){ const th=S.theme; S = freshDef(); S.theme=th; S.resetAt = Date.now(); save(); closeSheet(); toast("Progreso borrado"); render(); },
 
   /* --- tests por tema --- */
   startTemaTest(t, i){
@@ -1135,6 +1302,7 @@ window.A = A;
 /* ================== ARRANQUE ================== */
 applyTheme();
 render();
+SY.boot();
 </script>
 
 <script>
